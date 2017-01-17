@@ -64,26 +64,25 @@ public class PropertySecurityProcedures {
 
     private static MutableRoaringBitmap getPermissions(String username) throws SchemaRuleNotFoundException, IndexBrokenKernelException, IndexNotFoundKernelException, IOException, EntityNotFoundException {
         MutableRoaringBitmap permissions = new MutableRoaringBitmap();
-        try (Transaction tx = dbapi.beginTx()) {
-            ThreadToStatementContextBridge ctx = dbapi.getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class);
-            ReadOperations ops = ctx.get().readOperations();
-            Integer inSecurityGroupRelationshipTypeId = ops.relationshipTypeGetForName(RelationshipTypes.IN_SECURITY_GROUP.name());
-            Integer securityUserLabelId = ops.labelGetForName(Labels.SecurityUser.name());
-            Integer securityUsernamePropertyKeyId = ops.propertyKeyGetForName("username");
-            IndexDescriptor descriptor = ops.indexGetForLabelAndPropertyKey(securityUserLabelId, securityUsernamePropertyKeyId);
-            Cursor<NodeItem> users = ops.nodeCursorGetFromUniqueIndexSeek(descriptor, username);
-            if (users.next()) {
-                permissions = getRoaringBitmap(ops, users.get().id());
-                RelationshipIterator relationshipIterator = ops.nodeGetRelationships(users.get().id(), Direction.OUTGOING, inSecurityGroupRelationshipTypeId );
-                Cursor<RelationshipItem> c;
-                while (relationshipIterator.hasNext()) {
-                    c = ops.relationshipCursor(relationshipIterator.next());
-                    if (c.next()) {
-                        permissions.or(getRoaringBitmap(ops, c.get().endNode()));
-                    }
+        ThreadToStatementContextBridge ctx = dbapi.getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class);
+        ReadOperations ops = ctx.get().readOperations();
+
+        Integer inSecurityGroupRelationshipTypeId = ops.relationshipTypeGetForName(RelationshipTypes.IN_SECURITY_GROUP.name());
+        Integer securityUserLabelId = ops.labelGetForName(Labels.SecurityUser.name());
+        Integer securityUsernamePropertyKeyId = ops.propertyKeyGetForName("username");
+        IndexDescriptor descriptor = ops.indexGetForLabelAndPropertyKey(securityUserLabelId, securityUsernamePropertyKeyId);
+        Cursor<NodeItem> users = ops.nodeCursorGetFromUniqueIndexSeek(descriptor, username);
+
+        if (users.next()) {
+            permissions = getRoaringBitmap(ops, users.get().id());
+            RelationshipIterator relationshipIterator = ops.nodeGetRelationships(users.get().id(), Direction.OUTGOING, inSecurityGroupRelationshipTypeId );
+            Cursor<RelationshipItem> c;
+            while (relationshipIterator.hasNext()) {
+                c = ops.relationshipCursor(relationshipIterator.next());
+                if (c.next()) {
+                    permissions.or(getRoaringBitmap(ops, c.get().endNode()));
                 }
             }
-            tx.success();
         }
         return permissions;
     }
@@ -109,78 +108,66 @@ public class PropertySecurityProcedures {
                                        @Name("relationshipType") String relationshipType,
                                        @Name("depth") Number depth) {
         ArrayList<MapResult> results = new ArrayList<>();
-            this.dbapi = (GraphDatabaseAPI) db;
+        this.dbapi = (GraphDatabaseAPI) db;
 
-            if (keys.isEmpty()) {
-                try (Transaction tx = db.beginTx()) {
-                    ThreadToStatementContextBridge ctx = dbapi.getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class);
-                    ReadOperations ops = ctx.get().readOperations();
+        if (keys.isEmpty()) {
+            ThreadToStatementContextBridge ctx = dbapi.getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class);
+            ReadOperations ops = ctx.get().readOperations();
 
-                    for (String name : db.getAllPropertyKeys()) {
-                        keys.put(name, ops.propertyKeyGetForName(name));
-                    }
-                    tx.success();
+            for (String name : db.getAllPropertyKeys()) {
+                keys.put(name, ops.propertyKeyGetForName(name));
+            }
+        }
+
+
+        MutableRoaringBitmap userPermissions = permissions.get(ktx.securityContext().subject().username());
+
+
+        final Node start = db.findNode(Label.label(label), key, value);
+        TraversalDescription td = db.traversalDescription()
+                .depthFirst()
+                .expand(PathExpanders.forType(RelationshipType.withName(relationshipType)))
+                .uniqueness(Uniqueness.NODE_GLOBAL)
+                .evaluator(Evaluators.toDepth(depth.intValue()));
+
+        Set<Long> connectedIds = new HashSet<>();
+        for (org.neo4j.graphdb.Path position : td.traverse(start)) {
+            connectedIds.add(position.endNode().getId());
+        }
+        connectedIds.forEach((Long nodeId) -> {
+            Node node = db.getNodeById(nodeId);
+            Map<String, Object> properties = node.getAllProperties();
+            Map<String, Object> filteredProperties = new HashMap<>();
+            for (String property : properties.keySet()) {
+                Integer permission = toIntExact((nodeId << 8) | (keys.get(property) & 0x3FF));
+                if (userPermissions.contains(permission)) {
+                    filteredProperties.put(key, properties.get(key));
                 }
             }
-
-            String username;
-            try (Transaction tx = db.beginTx()) {
-                username = ktx.securityContext().subject().username();
-                tx.success();
+            if (!filteredProperties.isEmpty()) {
+                results.add(new MapResult(filteredProperties));
             }
-            MutableRoaringBitmap userPermissions = permissions.get(username);
-
-            try (Transaction tx = db.beginTx()) {
-                final Node start = db.findNode(Label.label(label), key, value);
-                TraversalDescription td = db.traversalDescription()
-                        .depthFirst()
-                        .expand(PathExpanders.forType(RelationshipType.withName(relationshipType)))
-                        .uniqueness(Uniqueness.NODE_GLOBAL)
-                        .evaluator(Evaluators.toDepth(depth.intValue()));
-
-                Set<Long> connectedIds = new HashSet<>();
-                for (org.neo4j.graphdb.Path position : td.traverse(start)) {
-                    connectedIds.add(position.endNode().getId());
-                }
-                connectedIds.forEach((Long nodeId) -> {
-                    Node node = db.getNodeById(nodeId);
-                    Map<String, Object> properties = node.getAllProperties();
-                    Map<String, Object> filteredProperties = new HashMap<>();
-                    for (String property : properties.keySet()) {
-                        Integer permission = toIntExact((nodeId << 8) | (keys.get(property) & 0x3FF));
-                        if (userPermissions.contains(permission)) {
-                            filteredProperties.put(key, properties.get(key));
-                        }
-                    }
-                    if (!filteredProperties.isEmpty()) {
-                        results.add(new MapResult(filteredProperties));
-                    }
-                });
-                tx.success();
-            }
+        });
         return results.stream();
     }
 
     @Description("com.maxdemarzi.generateSecuritySchema() | Creates schema for SecurityUser and SecurityGroup")
     @Procedure(name = "com.maxdemarzi.generateSecuritySchema", mode = Mode.SCHEMA)
     public Stream<StringResult> generateSecuritySchema() throws IOException {
-        try (Transaction tx = db.beginTx()) {
-            if ( ktx.securityContext().isAdmin() ) {
-                org.neo4j.graphdb.schema.Schema schema = db.schema();
-                if (!schema.getConstraints(Labels.SecurityUser).iterator().hasNext()) {
-                    schema.constraintFor(Labels.SecurityUser)
-                            .assertPropertyIsUnique("username")
-                            .create();
-                }
-                if (!schema.getConstraints(Labels.SecurityGroup).iterator().hasNext()) {
-                    schema.constraintFor(Labels.SecurityGroup)
-                            .assertPropertyIsUnique("name")
-                            .create();
-                }
-
-                db.execute("CALL dbms.security.createRole(\"secured\")");
+        if ( ktx.securityContext().isAdmin() ) {
+            org.neo4j.graphdb.schema.Schema schema = db.schema();
+            if (!schema.getConstraints(Labels.SecurityUser).iterator().hasNext()) {
+                schema.constraintFor(Labels.SecurityUser)
+                        .assertPropertyIsUnique("username")
+                        .create();
             }
-            tx.success();
+            if (!schema.getConstraints(Labels.SecurityGroup).iterator().hasNext()) {
+                schema.constraintFor(Labels.SecurityGroup)
+                        .assertPropertyIsUnique("name")
+                        .create();
+            }
+
+            db.execute("CALL dbms.security.createRole(\"secured\")");
         }
         return Stream.of(new StringResult("Security Schema Generated"));
     }
@@ -190,24 +177,21 @@ public class PropertySecurityProcedures {
     public Stream<NodeResult> createUserWithPropertyRights(@Name("username") String username,
                                                            @Name("password") String password,
                                                            @Name("mustChange") boolean mustChange) throws IOException {
-        Node user = null;
-         try( Transaction tx = db.beginTx()) {
-             if ( ktx.securityContext().isAdmin() ) {
-                 Map<String, Object> params = new HashMap<>();
-                 params.put("username", username);
-                 params.put("password", password);
-                 params.put("mustChange", mustChange);
-                 params.put("group", "secured");
+         Node user = null;
+         if ( ktx.securityContext().isAdmin() ) {
+             Map<String, Object> params = new HashMap<>();
+             params.put("username", username);
+             params.put("password", password);
+             params.put("mustChange", mustChange);
+             params.put("group", "secured");
 
-                 String request = "CALL dbms.security.createUser({username},{password},{mustChange})";
-                 db.execute(request, params);
-                 request = "CALL dbms.security.addRoleToUser({group}, {username})";
-                 db.execute(request, params);
-                 user = db.createNode(Labels.SecurityUser);
-                 user.setProperty("username", username);
-                 createPermissionsProperty(user);
-             }
-             tx.success();
+             String request = "CALL dbms.security.createUser({username},{password},{mustChange})";
+             db.execute(request, params);
+             request = "CALL dbms.security.addRoleToUser({group}, {username})";
+             db.execute(request, params);
+             user = db.createNode(Labels.SecurityUser);
+             user.setProperty("username", username);
+             createPermissionsProperty(user);
          }
          return Stream.of(new NodeResult(user));
     }
@@ -215,14 +199,11 @@ public class PropertySecurityProcedures {
     @Description("com.maxdemarzi.createGroupWithPropertyRights(name) | Creates a SecurityGroup Node")
     @Procedure(mode = Mode.WRITE)
     public Stream<NodeResult> createGroupWithPropertyRights(@Name("name") String name) throws IOException {
-       Node group = null;
-        try( Transaction tx = db.beginTx()) {
-            if ( ktx.securityContext().isAdmin() ) {
-                group = db.createNode(Labels.SecurityGroup);
-                group.setProperty("name", name);
-                createPermissionsProperty(group);
-            }
-            tx.success();
+        Node group = null;
+        if ( ktx.securityContext().isAdmin() ) {
+            group = db.createNode(Labels.SecurityGroup);
+            group.setProperty("name", name);
+            createPermissionsProperty(group);
         }
         return Stream.of(new NodeResult(group));
     }
@@ -231,14 +212,11 @@ public class PropertySecurityProcedures {
     @Procedure(mode = Mode.WRITE)
     public Stream<RelationshipResult> addUserMembership(@Name("username") String username, @Name("group") String name) throws IOException {
         Relationship rel = null;
-        try( Transaction tx = db.beginTx()) {
             if ( ktx.securityContext().isAdmin() ) {
                 Node user = db.findNode(Labels.SecurityUser, "username", username);
                 Node group = db.findNode(Labels.SecurityGroup, "name", name);
                 rel = user.createRelationshipTo(group, IN_SECURITY_GROUP);
             }
-            tx.success();
-        }
         return Stream.of(new RelationshipResult(rel));
     }
 
@@ -246,19 +224,17 @@ public class PropertySecurityProcedures {
     @Procedure(mode = Mode.WRITE)
     public Stream<RelationshipResult> removeUserMembership(@Name("username") String username, @Name("group") String name) throws IOException {
         Relationship rel = null;
-        try( Transaction tx = db.beginTx()) {
-            if ( ktx.securityContext().isAdmin() ) {
-                Node user = db.findNode(Labels.SecurityUser, "username", username);
-                Node group = db.findNode(Labels.SecurityGroup, "name", name);
-                for (Relationship relationship : user.getRelationships(IN_SECURITY_GROUP, Direction.OUTGOING)) {
-                    if (relationship.getEndNode().equals(group)) {
-                        rel = relationship;
-                        relationship.delete();
-                        break;
-                    }
+
+        if ( ktx.securityContext().isAdmin() ) {
+            Node user = db.findNode(Labels.SecurityUser, "username", username);
+            Node group = db.findNode(Labels.SecurityGroup, "name", name);
+            for (Relationship relationship : user.getRelationships(IN_SECURITY_GROUP, Direction.OUTGOING)) {
+                if (relationship.getEndNode().equals(group)) {
+                    rel = relationship;
+                    relationship.delete();
+                    break;
                 }
             }
-            tx.success();
         }
         return Stream.of(new RelationshipResult(rel));
     }
@@ -308,12 +284,9 @@ public class PropertySecurityProcedures {
     }
 
     private void updatePermission(Label label, String key, String value, @Name("node") Node node, @Name("property") String property, boolean set) throws IOException {
-        try (Transaction transaction = db.beginTx()) {
-            if (ktx.securityContext().isAdmin()) {
-                Node securityNode = db.findNode(label, key, value);
-                changePermission(securityNode, node, property, set);
-                transaction.success();
-            }
+        if (ktx.securityContext().isAdmin()) {
+            Node securityNode = db.findNode(label, key, value);
+            changePermission(securityNode, node, property, set);
         }
     }
 
@@ -345,13 +318,10 @@ public class PropertySecurityProcedures {
 
     private void cachePropertyId(@Name("property") String property) {
         if (!keys.containsKey(property)) {
-            try( Transaction tx = db.beginTx()) {
-                ThreadToStatementContextBridge ctx = ((GraphDatabaseAPI)db).getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class);
-                ReadOperations ops = ctx.get().readOperations();
-                for (String key :db.getAllPropertyKeys() ) {
-                    keys.put(key, ops.propertyKeyGetForName(key));
-                }
-                tx.success();
+            ThreadToStatementContextBridge ctx = ((GraphDatabaseAPI)db).getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class);
+            ReadOperations ops = ctx.get().readOperations();
+            for (String key :db.getAllPropertyKeys() ) {
+                keys.put(key, ops.propertyKeyGetForName(key));
             }
         }
     }

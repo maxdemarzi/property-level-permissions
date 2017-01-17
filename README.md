@@ -58,8 +58,10 @@ Instructions
 6. Give user 'max' access to the name property of n2.
         
         MATCH (n2:Person {name:'Tim'})
-        CALL com.maxdemarzi.addUserPermission('max', n2, 'name'); 
+        CALL com.maxdemarzi.addUserPermission('max', n2, 'name') 
+        YIELD value RETURN value; 
         
 7. Try a query:
         
-        CALL com.maxdemarzi.connected('Person', 'name', 'Tom', 'KNOWS', 2);
+        CALL com.maxdemarzi.connected('Person', 'name', 'Tom', 'KNOWS', 2)
+        YIELD value RETURN value;

@@ -29,19 +29,8 @@ Instructions
 2. Create the schema:
 
         CALL com.maxdemarzi.generateSecuritySchema;
-        
-        or 
-        
-        CREATE CONSTRAINT ON (p:SecurityUser)
-        ASSERT p.username IS UNIQUE;
-        
-        CREATE CONSTRAINT ON (p:SecurityGroup)
-        ASSERT p.name IS UNIQUE;
-        
-        // Create the custom security role:
-        CALL dbms.security.createRole("secured");
 
-4. Create a user with property rights:
+3. Create a user with property rights:
  
         CALL com.maxdemarzi.createUserWithPropertyRights(username, password, mustChange);
         
@@ -49,17 +38,19 @@ Instructions
         
         CALL com.maxdemarzi.createUserWithPropertyRights('max', 'swordfish', false);
         
-5. Create some data:
+4. Create some data:
         
         CREATE (n1:Person {name:'Tom', age:37})
         CREATE (n2:Person {name:'Tim', age:38})
         CREATE (n1)-[:KNOWS]->(n2);
         
-6. Give user 'max' access to the name property of n2.
+5. Give user 'max' access to the name property of n2.
         
         MATCH (n2:Person {name:'Tim'})
         CALL com.maxdemarzi.addUserPermission('max', n2, 'name') 
         YIELD value RETURN value; 
+ 
+6. Log out and log back in as user 'max', password 'swordfish'.        
         
 7. Try a query:
         

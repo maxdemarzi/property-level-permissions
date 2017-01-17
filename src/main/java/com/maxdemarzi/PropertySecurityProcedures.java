@@ -53,25 +53,6 @@ public class PropertySecurityProcedures {
     @Context
     public KernelTransaction ktx;
 
-//    public PropertySecurityProcedures() {
-//        this.dbapi = (GraphDatabaseAPI) db;
-//
-//        if (keys.isEmpty()) {
-//            try (Transaction tx = db.beginTx()) {
-//                ThreadToStatementContextBridge ctx = dbapi.getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class);
-//                ReadOperations ops = ctx.get().readOperations();
-//
-//                for (String key : db.getAllPropertyKeys() ) {
-//                    keys.put(key, ops.propertyKeyGetForName(key));
-//                }
-//                tx.success();
-//            }
-//        }
-//    }
-//
-//    public PropertySecurityProcedures(GraphDatabaseAPI db) {
-//    }
-
     // This caches our property key ids
     private static final HashMap<String, Integer> keys = new HashMap<>();
 
@@ -102,7 +83,7 @@ public class PropertySecurityProcedures {
                     }
                 }
             }
-            tx.success();
+            //tx.success();
         }
         return permissions;
     }
@@ -120,57 +101,89 @@ public class PropertySecurityProcedures {
 
     }
 
-    @Procedure
     @Description("com.maxdemarzi.connected(label, key, value, relationshipType, depth) | Find connected nodes out to a certain depth")
+    @Procedure(name = "com.maxdemarzi.connected")
     public Stream<MapResult> connected(@Name("label") String label,
                                        @Name("key") String key,
                                        @Name("value") Object value,
                                        @Name("relationshipType") String relationshipType,
                                        @Name("depth") Number depth) {
         ArrayList<MapResult> results = new ArrayList<>();
-        this.dbapi = (GraphDatabaseAPI) db;
-        String username;
-        try (Transaction tx = db.beginTx()) {
-            username = ktx.securityContext().subject().username();
-        }
-        MutableRoaringBitmap userPermissions = permissions.get(username);
+        try {
+            log.info("here");
 
-        try (Transaction tx = db.beginTx()) {
-            final Node start = db.findNode(Label.label(label), key, value);
+            this.dbapi = (GraphDatabaseAPI) db;
 
-            TraversalDescription td =  db.traversalDescription()
-                    .depthFirst()
-                    .expand(PathExpanders.forType(RelationshipType.withName(relationshipType)))
-                    .uniqueness(Uniqueness.NODE_GLOBAL)
-                    .evaluator(Evaluators.toDepth(depth.intValue()));
+            if (keys.isEmpty()) {
+                try (Transaction tx = db.beginTx()) {
+                    ThreadToStatementContextBridge ctx = dbapi.getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class);
+                    ReadOperations ops = ctx.get().readOperations();
 
-            Set<Long> connectedIds = new HashSet<>();
-            for (org.neo4j.graphdb.Path position : td.traverse(start)) {
-                connectedIds.add(position.endNode().getId());
-            }
-
-            connectedIds.forEach((Long nodeId) -> {
-                Node node = db.getNodeById(nodeId);
-                Map<String, Object> properties = node.getAllProperties();
-                Map<String, Object> filteredProperties = new HashMap<>();
-                for (String property : properties.keySet()) {
-                    Integer permission = toIntExact((nodeId << 8) | (keys.get(property) & 0xF));
-                    if(userPermissions.contains(permission)) {
-                        filteredProperties.put(key, properties.get(key));
+                    for (String name : db.getAllPropertyKeys()) {
+                        log.info("adding to keys " + name);
+                        keys.put(name, ops.propertyKeyGetForName(name));
                     }
                 }
-                if(!filteredProperties.isEmpty()) {
-                     results.add(new MapResult(filteredProperties));
-                }
+            } else {
+                log.info("keys is not empty");
+            }
 
-            });
-            tx.success();
+            String username;
+            try (Transaction tx = db.beginTx()) {
+                log.info("getting username");
+                username = ktx.securityContext().subject().username();
+            }
+            log.info("got username " + username);
+            MutableRoaringBitmap userPermissions = permissions.get(username);
+            log.info(userPermissions.toString());
+            try (Transaction tx = db.beginTx()) {
+                final Node start = db.findNode(Label.label(label), key, value);
+                log.info("found start " + start.getId());
+                TraversalDescription td = db.traversalDescription()
+                        .depthFirst()
+                        .expand(PathExpanders.forType(RelationshipType.withName(relationshipType)))
+                        .uniqueness(Uniqueness.NODE_GLOBAL)
+                        .evaluator(Evaluators.toDepth(depth.intValue()));
+
+                Set<Long> connectedIds = new HashSet<>();
+                for (org.neo4j.graphdb.Path position : td.traverse(start)) {
+                    connectedIds.add(position.endNode().getId());
+                }
+                log.info("got ids " + connectedIds.size());
+                connectedIds.forEach((Long nodeId) -> {
+                    Node node = db.getNodeById(nodeId);
+                    Map<String, Object> properties = node.getAllProperties();
+                    Map<String, Object> filteredProperties = new HashMap<>();
+                    for (String property : properties.keySet()) {
+                        log.info("checking perms " + property);
+                        Integer permission = toIntExact((nodeId << 8) | (keys.get(property) & 0xF));
+                        log.info("gt perms " + permission);
+                        if (userPermissions.contains(permission)) {
+                            log.info("i haz access");
+                            filteredProperties.put(key, properties.get(key));
+                        }
+                    }
+                    if (!filteredProperties.isEmpty()) {
+                        log.info("adding to results");
+                        results.add(new MapResult(filteredProperties));
+                    }
+
+                });
+                //tx.success();
+                log.info("After success");
+            } catch (Exception e) {
+                log.info("exception thrown");
+                log.info(e.getMessage());
+            }
+        } catch (TransactionFailureException e) {
+            log.info(e.getMessage());
         }
+        log.info("before returning");
         return results.stream();
     }
 
     @Description("com.maxdemarzi.generateSecuritySchema() | Creates schema for SecurityUser and SecurityGroup")
-    @Procedure(mode = Mode.DBMS)
+    @Procedure(name = "com.maxdemarzi.generateSecuritySchema", mode = Mode.SCHEMA)
     public Stream<StringResult> generateSecuritySchema() throws IOException {
         try (Transaction tx = db.beginTx()) {
             if ( ktx.securityContext().isAdmin() ) {
@@ -201,10 +214,16 @@ public class PropertySecurityProcedures {
         Node user = null;
          try( Transaction tx = db.beginTx()) {
              if ( ktx.securityContext().isAdmin() ) {
-                 String request = "CALL dbms.security.createUser(\"" + username + "\", \"" + password + "\" , " + mustChange + ")";
-                 db.execute(request);
-                 request = "CALL dbms.security.addRoleToUser(\"secured\",\"" + username + "\")";
-                 db.execute(request);
+                 Map<String, Object> params = new HashMap<>();
+                 params.put("username", username);
+                 params.put("password", password);
+                 params.put("mustChange", mustChange);
+                 params.put("group", "secured");
+
+                 String request = "CALL dbms.security.createUser({username},{password},{mustChange})";
+                 db.execute(request, params);
+                 request = "CALL dbms.security.addRoleToUser({group}, {username})";
+                 db.execute(request, params);
                  user = db.createNode(Labels.SecurityUser);
                  user.setProperty("username", username);
                  createPermissionsProperty(user);
@@ -354,7 +373,7 @@ public class PropertySecurityProcedures {
                 for (String key :db.getAllPropertyKeys() ) {
                     keys.put(key, ops.propertyKeyGetForName(key));
                 }
-                tx.success();
+                //tx.success();
             }
         }
     }

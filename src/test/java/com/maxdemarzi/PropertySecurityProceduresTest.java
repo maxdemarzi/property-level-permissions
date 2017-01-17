@@ -19,7 +19,7 @@ public class PropertySecurityProceduresTest {
     public void setUp() throws Exception {
         db = new TestEnterpriseGraphDatabaseFactory().
                 newImpermanentDatabaseBuilder().
-                setConfig(GraphDatabaseSettings.auth_enabled, "true").
+                setConfig(GraphDatabaseSettings.auth_enabled, "false").
                 newGraphDatabase();
 
         Procedures proceduresService = ((GraphDatabaseAPI) db).getDependencyResolver().resolveDependency(Procedures.class);
@@ -35,7 +35,9 @@ public class PropertySecurityProceduresTest {
     @Ignore
     public void shouldCreateUserWithPropertyRights() {
         try (Transaction tx = db.beginTx()) {
-            String cypher = "CALL dbms.security.createUserWithPropertyRights('max', 'swordfish', false)";
+            String cypher = "CALL com.maxdemarzi.generateSecuritySchema()";
+            db.execute(cypher);
+            cypher = "CALL com.maxdemarzi.createUserWithPropertyRights('max', 'swordfish', false)";
             db.execute(cypher);
             tx.success();
         }

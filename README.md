@@ -32,11 +32,11 @@ Instructions
 
 3. Create a user with property rights:
  
-        CALL com.maxdemarzi.createUserWithPropertyRights(username, password, mustChange);
-        
-        for example:
-        
         CALL com.maxdemarzi.createUserWithPropertyRights('max', 'swordfish', false);
+                        
+        the parameters are:
+        
+        CALL com.maxdemarzi.createUserWithPropertyRights(username, password, mustChange);
         
 4. Create some data:
         

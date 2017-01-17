@@ -83,7 +83,7 @@ public class PropertySecurityProcedures {
                     }
                 }
             }
-            //tx.success();
+            tx.success();
         }
         return permissions;
     }
@@ -109,9 +109,6 @@ public class PropertySecurityProcedures {
                                        @Name("relationshipType") String relationshipType,
                                        @Name("depth") Number depth) {
         ArrayList<MapResult> results = new ArrayList<>();
-        try {
-            log.info("here");
-
             this.dbapi = (GraphDatabaseAPI) db;
 
             if (keys.isEmpty()) {
@@ -120,25 +117,21 @@ public class PropertySecurityProcedures {
                     ReadOperations ops = ctx.get().readOperations();
 
                     for (String name : db.getAllPropertyKeys()) {
-                        log.info("adding to keys " + name);
                         keys.put(name, ops.propertyKeyGetForName(name));
                     }
+                    tx.success();
                 }
-            } else {
-                log.info("keys is not empty");
             }
 
             String username;
             try (Transaction tx = db.beginTx()) {
-                log.info("getting username");
                 username = ktx.securityContext().subject().username();
+                tx.success();
             }
-            log.info("got username " + username);
             MutableRoaringBitmap userPermissions = permissions.get(username);
-            log.info(userPermissions.toString());
+
             try (Transaction tx = db.beginTx()) {
                 final Node start = db.findNode(Label.label(label), key, value);
-                log.info("found start " + start.getId());
                 TraversalDescription td = db.traversalDescription()
                         .depthFirst()
                         .expand(PathExpanders.forType(RelationshipType.withName(relationshipType)))
@@ -149,36 +142,22 @@ public class PropertySecurityProcedures {
                 for (org.neo4j.graphdb.Path position : td.traverse(start)) {
                     connectedIds.add(position.endNode().getId());
                 }
-                log.info("got ids " + connectedIds.size());
                 connectedIds.forEach((Long nodeId) -> {
                     Node node = db.getNodeById(nodeId);
                     Map<String, Object> properties = node.getAllProperties();
                     Map<String, Object> filteredProperties = new HashMap<>();
                     for (String property : properties.keySet()) {
-                        log.info("checking perms " + property);
-                        Integer permission = toIntExact((nodeId << 8) | (keys.get(property) & 0xF));
-                        log.info("gt perms " + permission);
+                        Integer permission = toIntExact((nodeId << 8) | (keys.get(property) & 0x3FF));
                         if (userPermissions.contains(permission)) {
-                            log.info("i haz access");
                             filteredProperties.put(key, properties.get(key));
                         }
                     }
                     if (!filteredProperties.isEmpty()) {
-                        log.info("adding to results");
                         results.add(new MapResult(filteredProperties));
                     }
-
                 });
-                //tx.success();
-                log.info("After success");
-            } catch (Exception e) {
-                log.info("exception thrown");
-                log.info(e.getMessage());
+                tx.success();
             }
-        } catch (TransactionFailureException e) {
-            log.info(e.getMessage());
-        }
-        log.info("before returning");
         return results.stream();
     }
 
@@ -227,9 +206,8 @@ public class PropertySecurityProcedures {
                  user = db.createNode(Labels.SecurityUser);
                  user.setProperty("username", username);
                  createPermissionsProperty(user);
-                 tx.success();
-
              }
+             tx.success();
          }
          return Stream.of(new NodeResult(user));
     }
@@ -243,8 +221,8 @@ public class PropertySecurityProcedures {
                 group = db.createNode(Labels.SecurityGroup);
                 group.setProperty("name", name);
                 createPermissionsProperty(group);
-                tx.success();
             }
+            tx.success();
         }
         return Stream.of(new NodeResult(group));
     }
@@ -258,8 +236,8 @@ public class PropertySecurityProcedures {
                 Node user = db.findNode(Labels.SecurityUser, "username", username);
                 Node group = db.findNode(Labels.SecurityGroup, "name", name);
                 rel = user.createRelationshipTo(group, IN_SECURITY_GROUP);
-                tx.success();
             }
+            tx.success();
         }
         return Stream.of(new RelationshipResult(rel));
     }
@@ -279,8 +257,8 @@ public class PropertySecurityProcedures {
                         break;
                     }
                 }
-                tx.success();
             }
+            tx.success();
         }
         return Stream.of(new RelationshipResult(rel));
     }
@@ -340,7 +318,7 @@ public class PropertySecurityProcedures {
     }
 
     private void changePermission(Node user, @Name("node") Node node, @Name("property") String property, boolean set ) throws IOException {
-        Integer permission = toIntExact((node.getId() << 8) | (keys.get(property) & 0xF));
+        Integer permission = toIntExact((node.getId() << 8) | (keys.get(property) & 0x3FF));
         byte[] bytes;
         MutableRoaringBitmap userPermissions = getPermissions(user);
         if (set) {
@@ -373,7 +351,7 @@ public class PropertySecurityProcedures {
                 for (String key :db.getAllPropertyKeys() ) {
                     keys.put(key, ops.propertyKeyGetForName(key));
                 }
-                //tx.success();
+                tx.success();
             }
         }
     }

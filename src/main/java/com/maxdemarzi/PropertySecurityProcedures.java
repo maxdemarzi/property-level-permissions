@@ -1,25 +1,43 @@
 package com.maxdemarzi;
 
+import apoc.result.MapResult;
 import apoc.result.NodeResult;
 import apoc.result.RelationshipResult;
 import apoc.result.StringResult;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.LoadingCache;
+import org.neo4j.cursor.Cursor;
 import org.neo4j.graphdb.*;
+import org.neo4j.graphdb.traversal.Evaluators;
+import org.neo4j.graphdb.traversal.TraversalDescription;
+import org.neo4j.graphdb.traversal.Uniqueness;
 import org.neo4j.kernel.api.KernelTransaction;
 import org.neo4j.kernel.api.ReadOperations;
+import org.neo4j.kernel.api.exceptions.EntityNotFoundException;
+import org.neo4j.kernel.api.exceptions.index.IndexNotFoundKernelException;
+import org.neo4j.kernel.api.exceptions.schema.IndexBrokenKernelException;
+import org.neo4j.kernel.api.exceptions.schema.SchemaRuleNotFoundException;
+import org.neo4j.kernel.api.index.IndexDescriptor;
+import org.neo4j.kernel.impl.api.store.RelationshipIterator;
 import org.neo4j.kernel.impl.core.ThreadToStatementContextBridge;
 import org.neo4j.kernel.internal.GraphDatabaseAPI;
 import org.neo4j.logging.Log;
 import org.neo4j.procedure.*;
+import org.neo4j.storageengine.api.NodeItem;
+import org.neo4j.storageengine.api.RelationshipItem;
 import org.roaringbitmap.buffer.MutableRoaringBitmap;
 
 import java.io.*;
-import java.util.HashMap;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 import static com.maxdemarzi.RelationshipTypes.IN_SECURITY_GROUP;
 import static java.lang.Math.toIntExact;
 
 public class PropertySecurityProcedures {
+
+    public static GraphDatabaseAPI dbapi;
 
     // This field declares that we need a GraphDatabaseService
     // as context when any procedure in this class is invoked
@@ -35,9 +53,135 @@ public class PropertySecurityProcedures {
     @Context
     public KernelTransaction tx;
 
-    // This caches our property key ids
-    private static final HashMap<String, Integer> keys = new HashMap();
+    public PropertySecurityProcedures() {
+        if (this.dbapi == null) {
+            this.dbapi = (GraphDatabaseAPI) db;
+        }
+        if (keys.isEmpty()) {
+            try (Transaction tx = db.beginTx()) {
+                ThreadToStatementContextBridge ctx = dbapi.getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class);
+                ReadOperations ops = ctx.get().readOperations();
 
+                for (String key : db.getAllPropertyKeys() ) {
+                    keys.put(key, ops.propertyKeyGetForName(key));
+                }
+                tx.success();
+            }
+        }
+    }
+
+    // This caches our property key ids
+    private static final HashMap<String, Integer> keys = new HashMap<>();
+
+    private static final LoadingCache<String, MutableRoaringBitmap> permissions = Caffeine.newBuilder()
+            .maximumSize(10_000)
+            .expireAfterWrite(5, TimeUnit.MINUTES)
+            .refreshAfterWrite(1, TimeUnit.MINUTES)
+            .build(userId -> getPermissions(userId));
+
+    private static MutableRoaringBitmap getPermissions(String username) throws SchemaRuleNotFoundException, IndexBrokenKernelException, IndexNotFoundKernelException, IOException, EntityNotFoundException {
+        MutableRoaringBitmap permissions = new MutableRoaringBitmap();
+        try (Transaction tx = dbapi.beginTx()) {
+            ThreadToStatementContextBridge ctx = dbapi.getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class);
+            ReadOperations ops = ctx.get().readOperations();
+            Integer inSecurityGroupRelationshipTypeId = ops.relationshipTypeGetForName(RelationshipTypes.IN_SECURITY_GROUP.name());
+            Integer securityUserLabelId = ops.labelGetForName(Labels.SecurityUser.name());
+            Integer securityUsernamePropertyKeyId = ops.propertyKeyGetForName("username");
+            IndexDescriptor descriptor = ops.indexGetForLabelAndPropertyKey(securityUserLabelId, securityUsernamePropertyKeyId);
+            Cursor<NodeItem> users = ops.nodeCursorGetFromUniqueIndexSeek(descriptor, username);
+            if (users.next()) {
+                permissions = getRoaringBitmap(ops, users.get().id());
+                RelationshipIterator relationshipIterator = ops.nodeGetRelationships(users.get().id(), Direction.OUTGOING, inSecurityGroupRelationshipTypeId );
+                Cursor<RelationshipItem> c;
+                while (relationshipIterator.hasNext()) {
+                    c = ops.relationshipCursor(relationshipIterator.next());
+                    if (c.next()) {
+                        permissions.or(getRoaringBitmap(ops, c.get().endNode()));
+                    }
+                }
+            }
+            tx.success();
+        }
+        return permissions;
+    }
+
+    private static MutableRoaringBitmap getRoaringBitmap(ReadOperations ops, long userNodeId) throws IOException, EntityNotFoundException {
+        MutableRoaringBitmap rb = new MutableRoaringBitmap();
+        byte[] nodeIds;
+        Integer permissionsPropertyKeyId = ops.propertyKeyGetForName("permissions");
+        if (ops.nodeHasProperty(userNodeId, permissionsPropertyKeyId)) {
+            nodeIds = (byte[]) ops.nodeGetProperty(userNodeId, permissionsPropertyKeyId);
+            ByteArrayInputStream bais = new ByteArrayInputStream(nodeIds);
+            rb.deserialize(new DataInputStream(bais));
+        }
+        return rb;
+
+    }
+
+    @Procedure
+    @Description("com.maxdemarzi.connected(label, key, value, relationshipType, depth) | Find connected nodes out to a certain depth")
+    public Stream<MapResult> connected(@Name("label") String label,
+                                       @Name("key") String key,
+                                       @Name("value") Object value,
+                                       @Name("relationshipType") String relationshipType,
+                                       @Name("depth") Number depth) {
+        ArrayList<MapResult> results = new ArrayList<>();
+        MutableRoaringBitmap userPermissions = permissions.get(tx.securityContext().subject().username());
+
+        try (Transaction tx = db.beginTx()) {
+            final Node start = db.findNode(Label.label(label), key, value);
+
+            TraversalDescription td =  db.traversalDescription()
+                    .depthFirst()
+                    .expand(PathExpanders.forType(RelationshipType.withName(relationshipType)))
+                    .uniqueness(Uniqueness.NODE_GLOBAL)
+                    .evaluator(Evaluators.toDepth(depth.intValue()));
+
+            Set<Long> connectedIds = new HashSet<>();
+            for (org.neo4j.graphdb.Path position : td.traverse(start)) {
+                connectedIds.add(position.endNode().getId());
+            }
+
+            connectedIds.forEach((Long nodeId) -> {
+                Node node = db.getNodeById(nodeId);
+                Map<String, Object> properties = node.getAllProperties();
+                Map<String, Object> filteredProperties = new HashMap<>();
+                for (String property : properties.keySet()) {
+                    Integer permission = toIntExact((nodeId << 8) | (keys.get(property) & 0xF));
+                    if(userPermissions.contains(permission)) {
+                        filteredProperties.put(key, properties.get(key));
+                    }
+                }
+                if(!filteredProperties.isEmpty()) {
+                     results.add(new MapResult(filteredProperties));
+                }
+
+            });
+        }
+        return results.stream();
+    }
+
+    @Description("com.maxdemarzi.generateSecuritySchema() | Creates schema for SecurityUser and SecurityGroup")
+    @Procedure(mode = Mode.WRITE)
+    public Stream<StringResult> generateSecuritySchema() throws IOException {
+        try (Transaction tx = db.beginTx()) {
+            org.neo4j.graphdb.schema.Schema schema = db.schema();
+            if (!schema.getConstraints(Labels.SecurityUser).iterator().hasNext()) {
+                schema.constraintFor(Labels.SecurityUser)
+                        .assertPropertyIsUnique("username")
+                        .create();
+            }
+            if (!schema.getConstraints(Labels.SecurityGroup).iterator().hasNext()) {
+                schema.constraintFor(Labels.SecurityGroup)
+                        .assertPropertyIsUnique("name")
+                        .create();
+            }
+
+            db.execute("CALL dbms.security.createRole(\"secured\")");
+            tx.success();
+        }
+        return Stream.of(new StringResult("Security Schema Generated"));
+    }
 
     @Description("com.maxdemarzi.createUserWithPropertyRights(username, password, mustChange) | Creates a User and SecurityUser Node")
     @Procedure(mode = Mode.WRITE)
@@ -47,8 +191,9 @@ public class PropertySecurityProcedures {
         Node user = null;
          try( Transaction transaction = db.beginTx()) {
              if ( tx.securityContext().isAdmin() ) {
-                 String request = "CALL com.maxdemarzi.createUser(\"" + username + "\", \"" + password + "\" , " + mustChange + ")";
+                 String request = "CALL dbms.security.createUser(\"" + username + "\", \"" + password + "\" , " + mustChange + ")";
                  db.execute(request);
+                 request = "CALL dbms.security.addRoleToUser(\"secured\",\"" + username + "\")";
                  user = db.createNode(Labels.SecurityUser);
                  user.setProperty("username", username);
                  createPermissionsProperty(user);

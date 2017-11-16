@@ -14,16 +14,18 @@ import org.neo4j.graphdb.traversal.Uniqueness;
 import org.neo4j.kernel.api.KernelTransaction;
 import org.neo4j.kernel.api.ReadOperations;
 import org.neo4j.kernel.api.exceptions.EntityNotFoundException;
+import org.neo4j.kernel.api.exceptions.index.IndexNotApplicableKernelException;
 import org.neo4j.kernel.api.exceptions.index.IndexNotFoundKernelException;
 import org.neo4j.kernel.api.exceptions.schema.IndexBrokenKernelException;
 import org.neo4j.kernel.api.exceptions.schema.SchemaRuleNotFoundException;
-import org.neo4j.kernel.api.index.IndexDescriptor;
+import org.neo4j.kernel.api.schema.IndexQuery;
+import org.neo4j.kernel.api.schema.LabelSchemaDescriptor;
+import org.neo4j.kernel.api.schema.index.IndexDescriptor;
 import org.neo4j.kernel.impl.api.store.RelationshipIterator;
 import org.neo4j.kernel.impl.core.ThreadToStatementContextBridge;
 import org.neo4j.kernel.internal.GraphDatabaseAPI;
 import org.neo4j.logging.Log;
 import org.neo4j.procedure.*;
-import org.neo4j.storageengine.api.NodeItem;
 import org.neo4j.storageengine.api.RelationshipItem;
 import org.roaringbitmap.buffer.MutableRoaringBitmap;
 
@@ -62,7 +64,7 @@ public class PropertySecurityProcedures {
             .refreshAfterWrite(1, TimeUnit.MINUTES)
             .build(userId -> getPermissions(userId));
 
-    private static MutableRoaringBitmap getPermissions(String username) throws SchemaRuleNotFoundException, IndexBrokenKernelException, IndexNotFoundKernelException, IOException, EntityNotFoundException {
+    private static MutableRoaringBitmap getPermissions(String username) throws SchemaRuleNotFoundException, IndexBrokenKernelException, IndexNotFoundKernelException, IOException, EntityNotFoundException, IndexNotApplicableKernelException {
         MutableRoaringBitmap permissions = new MutableRoaringBitmap();
         ThreadToStatementContextBridge ctx = dbapi.getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class);
         ReadOperations ops = ctx.get().readOperations();
@@ -70,20 +72,22 @@ public class PropertySecurityProcedures {
         Integer inSecurityGroupRelationshipTypeId = ops.relationshipTypeGetForName(RelationshipTypes.IN_SECURITY_GROUP.name());
         Integer securityUserLabelId = ops.labelGetForName(Labels.SecurityUser.name());
         Integer securityUsernamePropertyKeyId = ops.propertyKeyGetForName("username");
-        IndexDescriptor descriptor = ops.indexGetForLabelAndPropertyKey(securityUserLabelId, securityUsernamePropertyKeyId);
-        Cursor<NodeItem> users = ops.nodeCursorGetFromUniqueIndexSeek(descriptor, username);
+        LabelSchemaDescriptor lsd = new LabelSchemaDescriptor(securityUserLabelId, securityUsernamePropertyKeyId);
+        IndexDescriptor descriptor = ops.indexGetForSchema(lsd);
+        IndexQuery.ExactPredicate predicate = IndexQuery.exact(securityUsernamePropertyKeyId, username);
+        Long nodeId = ops.nodeGetFromUniqueIndexSeek(descriptor, predicate);
 
-        if (users.next()) {
-            permissions = getRoaringBitmap(ops, users.get().id());
-            RelationshipIterator relationshipIterator = ops.nodeGetRelationships(users.get().id(), Direction.OUTGOING, inSecurityGroupRelationshipTypeId );
-            Cursor<RelationshipItem> c;
-            while (relationshipIterator.hasNext()) {
-                c = ops.relationshipCursor(relationshipIterator.next());
-                if (c.next()) {
-                    permissions.or(getRoaringBitmap(ops, c.get().endNode()));
-                }
+        permissions = getRoaringBitmap(ops, nodeId);
+        RelationshipIterator relationshipIterator = ops.nodeGetRelationships(nodeId, Direction.OUTGOING, new int[]{inSecurityGroupRelationshipTypeId} );
+
+        Cursor<RelationshipItem> c;
+        while (relationshipIterator.hasNext()) {
+            c = ops.relationshipCursorById(relationshipIterator.next());
+            if (c.next()) {
+                permissions.or(getRoaringBitmap(ops, c.get().endNode()));
             }
         }
+
         return permissions;
     }
 
@@ -92,7 +96,7 @@ public class PropertySecurityProcedures {
         byte[] nodeIds;
         Integer permissionsPropertyKeyId = ops.propertyKeyGetForName("permissions");
         if (ops.nodeHasProperty(userNodeId, permissionsPropertyKeyId)) {
-            nodeIds = (byte[]) ops.nodeGetProperty(userNodeId, permissionsPropertyKeyId);
+            nodeIds = (byte[]) ops.nodeGetProperty(userNodeId, permissionsPropertyKeyId).asObject();
             ByteArrayInputStream bais = new ByteArrayInputStream(nodeIds);
             rb.deserialize(new DataInputStream(bais));
         }
@@ -101,7 +105,7 @@ public class PropertySecurityProcedures {
     }
 
     @Description("com.maxdemarzi.connected(label, key, value, relationshipType, depth) | Find connected nodes out to a certain depth")
-    @Procedure(name = "com.maxdemarzi.connected")
+    @Procedure(name = "com.maxdemarzi.connected", mode = Mode.DEFAULT)
     public Stream<MapResult> connected(@Name("label") String label,
                                        @Name("key") String key,
                                        @Name("value") Object value,
@@ -118,7 +122,6 @@ public class PropertySecurityProcedures {
                 keys.put(name, ops.propertyKeyGetForName(name));
             }
         }
-
 
         MutableRoaringBitmap userPermissions = permissions.get(ktx.securityContext().subject().username());
 
@@ -139,7 +142,7 @@ public class PropertySecurityProcedures {
             Map<String, Object> properties = node.getAllProperties();
             Map<String, Object> filteredProperties = new HashMap<>();
             for (String property : properties.keySet()) {
-                Integer permission = toIntExact((nodeId << 8) | (keys.get(property) & 0x3FF));
+                Integer permission = toIntExact((nodeId << 8) | (keys.get(property) & 0xFF));
                 if (userPermissions.contains(permission)) {
                     filteredProperties.put(key, properties.get(key));
                 }
@@ -244,7 +247,6 @@ public class PropertySecurityProcedures {
     public Stream<StringResult> addUserPermission(@Name("username") String username,
                                                   @Name("node") Node node,
                                                   @Name("property") String property) throws IOException {
-
         cachePropertyId(property);
         updatePermission(Labels.SecurityUser, "username",  username, node, property, true);
         return Stream.of(new StringResult("User " + username + " permission to node " + node.getId() + " " + property + " added"));
@@ -291,7 +293,7 @@ public class PropertySecurityProcedures {
     }
 
     private void changePermission(Node user, @Name("node") Node node, @Name("property") String property, boolean set ) throws IOException {
-        Integer permission = toIntExact((node.getId() << 8) | (keys.get(property) & 0x3FF));
+        Integer permission = toIntExact((node.getId() << 8) | (keys.get(property) & 0xFF));
         byte[] bytes;
         MutableRoaringBitmap userPermissions = getPermissions(user);
         if (set) {

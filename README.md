@@ -11,11 +11,12 @@ Setup
         
 2. Copy jar to  to the plugins/ directory of your Neo4j server.
         
-        cp target/property-level-permissions-1.0-SNAPSHOT.jar neo4j-enterprise-3.1.0/plugins/.
+        cp target/property-level-permissions-1.0-SNAPSHOT.jar neo4j-enterprise-3.3.0/plugins/.
         
-3. Configure Neo4j by adding a line to conf/neo4j.conf:
+3. Configure Neo4j by adding these lines to conf/neo4j.conf:
         
         dbms.security.procedures.roles=com.maxdemarzi.connected:secured       
+        dbms.security.procedures.unrestricted=com.maxdemarzi.*
                 
 4. Start Neo4j server.
 
@@ -50,9 +51,11 @@ Instructions
         CALL com.maxdemarzi.addUserPermission('max', n2, 'name') 
         YIELD value RETURN value; 
  
-6. Log out and log back in as user 'max', password 'swordfish'.        
+6. Using Cypher-shell (in the Neo4j/bin directory) log in as user 'max', password 'swordfish'.        
         
 7. Try a query:
         
         CALL com.maxdemarzi.connected('Person', 'name', 'Tom', 'KNOWS', 2)
         YIELD value RETURN value;
+        
+You will not be able to log in via the Browser with the user "max", because it requires the Reader role.        
